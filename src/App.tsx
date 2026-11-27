@@ -12,6 +12,7 @@ const supabase = createClient(
 );
 
 const ELDER_ID_KEY = 'chuk_fuk_elder_id';
+const LAST_CHECKIN_DATE_KEY = 'chuk_fuk_last_checkin_hk_date';
 
 interface BehaviorRecord {
   elder_id: string;
@@ -29,6 +30,16 @@ interface RawCheckIn {
   elder_id: string;
   mood: string;
   created_at: string;
+}
+
+// 取得香港標準時間的「今日日期字串」（例如：2026-11-27），過晚上 12 點自動變成新一日
+function getTodayHKDateStr(dateObj: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Hong_Kong',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(dateObj);
 }
 
 function formatHKTime(isoString: string): string {
@@ -74,6 +85,31 @@ export default function App() {
   // 個別長者詳細檔案彈窗狀態
   const [selectedElder, setSelectedElder] = useState<BehaviorRecord | null>(null);
 
+  // 檢查指定長者今天（香港時間）是否已經打過卡
+  const checkIfCheckedInToday = async (id: string) => {
+    const todayHK = getTodayHKDateStr();
+    const localSavedDate = localStorage.getItem(`${LAST_CHECKIN_DATE_KEY}_${id}`);
+    if (localSavedDate === todayHK) {
+      return true;
+    }
+    // 同步向 Supabase 確認今日（HKT）是否有紀錄
+    const { data } = await supabase
+      .from('check_ins')
+      .select('created_at')
+      .eq('elder_id', id)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (data && data.length > 0) {
+      const latestHKDate = getTodayHKDateStr(new Date(data[0].created_at));
+      if (latestHKDate === todayHK) {
+        localStorage.setItem(`${LAST_CHECKIN_DATE_KEY}_${id}`, todayHK);
+        return true;
+      }
+    }
+    return false;
+  };
+
   const loadAnalyticsData = async () => {
     setScreen('admin');
     setLoadingAnalytics(true);
@@ -87,45 +123,68 @@ export default function App() {
   };
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    // 支援分享分析報告專屬連結 (?report=1 直接開啟分析儀表板)
-    if (params.get('report') === '1') {
-      loadAnalyticsData();
-      return;
-    }
-    if (params.get('admin') === '1') {
-      setShowPwdModal(true);
-    }
-    const savedId = localStorage.getItem(ELDER_ID_KEY);
-    if (savedId) {
-      setElderId(savedId);
-      setScreen('checkin');
-    } else {
-      setScreen('setup');
-    }
+    const init = async () => {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('report') === '1') {
+        await loadAnalyticsData();
+        return;
+      }
+      if (params.get('admin') === '1') {
+        setShowPwdModal(true);
+      }
+      const savedId = localStorage.getItem(ELDER_ID_KEY);
+      if (savedId) {
+        setElderId(savedId);
+        const alreadyDoneToday = await checkIfCheckedInToday(savedId);
+        setScreen(alreadyDoneToday ? 'success' : 'checkin');
+      } else {
+        setScreen('setup');
+      }
+    };
+    init();
   }, []);
 
-  const handleSaveId = (e: React.FormEvent) => {
+  // 每分鐘自動檢查一次是否已過香港時間晚上 12:00，一過 12 點自動解鎖新一天的打卡畫面
+  useEffect(() => {
+    if (screen !== 'success' || !elderId) return;
+    const timer = setInterval(() => {
+      const todayHK = getTodayHKDateStr();
+      const localSavedDate = localStorage.getItem(`${LAST_CHECKIN_DATE_KEY}_${elderId}`);
+      if (localSavedDate !== todayHK) {
+        setScreen('checkin');
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [screen, elderId]);
+
+  const handleSaveId = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = inputId.trim();
     if (!trimmed) return;
     localStorage.setItem(ELDER_ID_KEY, trimmed);
     setElderId(trimmed);
-    setScreen('checkin');
+    const alreadyDoneToday = await checkIfCheckedInToday(trimmed);
+    setScreen(alreadyDoneToday ? 'success' : 'checkin');
   };
 
   const handleCheckIn = async (moodText: string) => {
     if (!elderId || submitting) return;
     setSubmitting(true);
     try {
-      await supabase.from('check_ins').insert([{ elder_id: elderId, mood: moodText }]);
-      setScreen('success');
-      setTimeout(() => {
-        setScreen('checkin');
+      // 再次確認今日未打卡，雙重防止重複提交
+      const alreadyDone = await checkIfCheckedInToday(elderId);
+      if (alreadyDone) {
+        setScreen('success');
         setSubmitting(false);
-      }, 3000);
+        return;
+      }
+      const { error } = await supabase.from('check_ins').insert([{ elder_id: elderId, mood: moodText }]);
+      if (error) throw error;
+      localStorage.setItem(`${LAST_CHECKIN_DATE_KEY}_${elderId}`, getTodayHKDateStr());
+      setScreen('success');
     } catch {
       alert('網絡連線異常，請稍後再試');
+    } finally {
       setSubmitting(false);
     }
   };
@@ -171,18 +230,17 @@ export default function App() {
 
   const handleCopyShareLink = async () => {
     const shareUrl = `${window.location.origin}/?report=1`;
+    setCopiedLink(true);
     try {
       await navigator.clipboard.writeText(shareUrl);
-      setCopiedLink(true);
-      setTimeout(() => setCopiedLink(false), 3500);
     } catch {
-      alert(`請複製以下分析報告連結分享給同事：\n${shareUrl}`);
+      // 即使部分瀏覽器限制剪貼簿，下方提示框仍會顯示完整網址
     }
   };
 
   const BambooIcon = () => (
-    <div className="w-14 h-14 rounded-2xl bg-[#e3eed4] border-2 border-[#8ab85c] flex items-center justify-center shadow-sm shrink-0">
-      <svg viewBox="0 0 64 64" className="w-10 h-10">
+    <div className="w-12 h-12 sm:w-14 sm:h-14 rounded-2xl bg-[#e3eed4] border-2 border-[#8ab85c] flex items-center justify-center shadow-sm shrink-0">
+      <svg viewBox="0 0 64 64" className="w-9 h-9 sm:w-10 sm:h-10">
         <rect x="24" y="10" width="16" height="44" rx="4" fill="#68a336" stroke="#3c6619" strokeWidth="2.5" />
         <line x1="24" y1="24" x2="40" y2="24" stroke="#3c6619" strokeWidth="2.5" />
         <line x1="24" y1="40" x2="40" y2="40" stroke="#3c6619" strokeWidth="2.5" />
@@ -195,13 +253,28 @@ export default function App() {
     </div>
   );
 
+  // 頂部標題列：同時在電腦版與手機版清晰顯示「⚙️ 社工專區」齒輪按鈕
   const Header = () => (
-    <header className="w-full max-w-2xl mx-auto px-5 pt-5 pb-2 flex items-center justify-between">
-      <BambooIcon />
-      <div className="text-right text-[#2d4a16] font-bold leading-snug">
-        <div className="text-sm sm:text-base">竹園馬田法政牧師長者綜合服務中心</div>
-        <div className="text-xs sm:text-sm text-[#4e7a27]">長者支援服務隊</div>
+    <header className="w-full max-w-2xl mx-auto px-4 sm:px-5 pt-4 sm:pt-5 pb-2 flex items-center justify-between gap-2">
+      <div className="flex items-center gap-3">
+        <BambooIcon />
+        <div className="text-left text-[#2d4a16] font-bold leading-snug">
+          <div className="text-xs sm:text-base">竹園馬田法政牧師長者綜合服務中心</div>
+          <div className="text-[11px] sm:text-sm text-[#4e7a27]">長者支援服務隊</div>
+        </div>
       </div>
+      <button
+        onClick={() => {
+          setPwdInput('');
+          setPwdError(false);
+          setShowPwdModal(true);
+        }}
+        aria-label="社工設定"
+        className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white/80 hover:bg-white border border-[#cde0b4] text-[#3c6619] shadow-sm transition shrink-0"
+      >
+        <Settings className="w-5 h-5" />
+        <span className="text-xs sm:text-sm font-bold">社工</span>
+      </button>
     </header>
   );
 
@@ -246,7 +319,6 @@ export default function App() {
       autoInsights.push(`整體情緒趨勢：近 7 日共錄得 ${recent7d.length} 次打卡，開心佔 ${Math.round((happyCnt / totalMoodCnt) * 100)}%、一般佔 ${Math.round((normalCnt / totalMoodCnt) * 100)}%、唔開心佔 ${Math.round((unhappyCnt / totalMoodCnt) * 100)}%。`);
     }
 
-    // 計算選中長者的個別表現數據
     const elderHistory = selectedElder
       ? rawRecords.filter((r) => r.elder_id === selectedElder.elder_id)
       : [];
@@ -294,7 +366,7 @@ export default function App() {
                 className="flex items-center justify-center gap-1.5 bg-sky-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-sky-700 shadow-sm text-sm"
               >
                 <Share2 className="w-4 h-4" />
-                {copiedLink ? '✅ 已複製報告連結！' : '分享分析報告連結'}
+                分享分析報告連結
               </button>
               <button
                 onClick={handleSendReportEmail}
@@ -305,9 +377,14 @@ export default function App() {
                 {sendingEmail ? '發送中...' : '發送分析報告到社工電郵'}
               </button>
               <button
-                onClick={() => {
+                onClick={async () => {
                   window.history.replaceState({}, '', '/');
-                  setScreen(elderId ? 'checkin' : 'setup');
+                  if (elderId) {
+                    const done = await checkIfCheckedInToday(elderId);
+                    setScreen(done ? 'success' : 'checkin');
+                  } else {
+                    setScreen('setup');
+                  }
                 }}
                 className="flex items-center justify-center gap-1.5 bg-slate-800 text-white px-3.5 py-2.5 rounded-xl font-medium hover:bg-slate-700 text-sm"
               >
@@ -318,8 +395,18 @@ export default function App() {
           </div>
 
           {copiedLink && (
-            <div className="bg-sky-100 border border-sky-300 text-sky-900 px-4 py-3 rounded-xl font-medium flex items-center justify-between gap-2 text-sm">
-              <span>已複製專屬報告連結（<b>{window.location.origin}/?report=1</b>），可直接貼上 WhatsApp 或電郵傳送給同事查閱完整分析！</span>
+            <div className="bg-sky-50 border border-sky-300 text-sky-950 p-4 rounded-xl text-sm space-y-2">
+              <div className="font-bold flex items-center justify-between">
+                <span>🔗 專屬分析報告分享連結（可直接複製傳送給同事）：</span>
+                <button onClick={() => setCopiedLink(false)} className="text-sky-700 hover:underline text-xs">關閉提示</button>
+              </div>
+              <input
+                type="text"
+                readOnly
+                value={`${window.location.origin}/?report=1`}
+                onFocus={(e) => e.target.select()}
+                className="w-full bg-white border border-sky-300 rounded-lg px-3 py-2 font-mono text-xs text-slate-800"
+              />
             </div>
           )}
 
@@ -544,7 +631,6 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* 個人關鍵指標 */}
                 <div className="grid grid-cols-3 gap-2.5 text-center">
                   <div className="bg-emerald-50 p-3 rounded-2xl border border-emerald-100">
                     <div className="text-xs text-emerald-700">😄 開心總次數</div>
@@ -560,7 +646,6 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* 個人文字分析建議 */}
                 <div className="bg-sky-50 border border-sky-200 rounded-2xl p-4">
                   <h3 className="font-bold text-sky-950 text-sm mb-2">🔍 個案行為與作息分析</h3>
                   <ul className="space-y-2 text-sm text-sky-900">
@@ -570,7 +655,6 @@ export default function App() {
                   </ul>
                 </div>
 
-                {/* 個人歷史打卡時間軸 */}
                 <div>
                   <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5 mb-2.5">
                     <Calendar className="w-4 h-4 text-slate-500" />
@@ -667,29 +751,21 @@ export default function App() {
           </div>
         )}
 
+        {/* 今日已完成打卡鎖定畫面：整日保持此狀態，直至過香港時間晚上 12:00 自動解鎖 */}
         {screen === 'success' && (
-          <div className="w-full bg-white p-10 rounded-3xl shadow-lg border-4 border-emerald-400 text-center animate-bounce">
+          <div className="w-full bg-white p-8 sm:p-10 rounded-3xl shadow-lg border-4 border-emerald-400 text-center">
             <CheckCircle2 className="w-20 h-20 text-emerald-500 mx-auto mb-4" />
-            <div className="text-3xl sm:text-4xl font-extrabold text-emerald-700 leading-relaxed">
-              ✅ 打卡成功！
+            <div className="text-3xl sm:text-4xl font-extrabold text-emerald-700 leading-relaxed mb-3">
+              ✅ 今日已完成打卡！
               <br />
               明天再見！
             </div>
+            <p className="text-base text-slate-500 mt-4 bg-slate-50 py-2.5 px-4 rounded-xl inline-block">
+              長者編號：<b>{elderId}</b>（過晚上 12:00 後可再次打卡）
+            </p>
           </div>
         )}
       </main>
-
-      <button
-        onClick={() => {
-          setPwdInput('');
-          setPwdError(false);
-          setShowPwdModal(true);
-        }}
-        aria-label="社工設定"
-        className="fixed bottom-4 right-4 p-3 text-[#9ab582] hover:text-[#4e7a27] opacity-60 hover:opacity-100 transition"
-      >
-        <Settings className="w-6 h-6" />
-      </button>
 
       {showPwdModal && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
