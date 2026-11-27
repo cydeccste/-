@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { Settings, BarChart3, ArrowLeft, RotateCcw, AlertCircle, CheckCircle2, Clock, TrendingUp, Users } from 'lucide-react';
+import {
+  Settings, BarChart3, ArrowLeft, RotateCcw, AlertCircle,
+  CheckCircle2, Clock, TrendingUp, Users, Mail, Share2, X, ChevronRight, Calendar
+} from 'lucide-react';
 
 // 請在此填入你的 Supabase URL 與 Publishable Key
 const supabase = createClient(
@@ -64,8 +67,35 @@ export default function App() {
   const [analytics, setAnalytics] = useState<BehaviorRecord[]>([]);
   const [rawRecords, setRawRecords] = useState<RawCheckIn[]>([]);
   const [loadingAnalytics, setLoadingAnalytics] = useState(false);
+  const [sendingEmail, setSendingEmail] = useState(false);
+  const [emailSentStatus, setEmailSentStatus] = useState<'idle' | 'sent' | 'error'>('idle');
+  const [copiedLink, setCopiedLink] = useState(false);
+
+  // 個別長者詳細檔案彈窗狀態
+  const [selectedElder, setSelectedElder] = useState<BehaviorRecord | null>(null);
+
+  const loadAnalyticsData = async () => {
+    setScreen('admin');
+    setLoadingAnalytics(true);
+    const [viewRes, rawRes] = await Promise.all([
+      supabase.from('elder_behavior_analysis').select('*').order('behavior_alert', { ascending: true }),
+      supabase.from('check_ins').select('*').order('created_at', { ascending: false }).limit(1000),
+    ]);
+    if (viewRes.data) setAnalytics(viewRes.data);
+    if (rawRes.data) setRawRecords(rawRes.data);
+    setLoadingAnalytics(false);
+  };
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    // 支援分享分析報告專屬連結 (?report=1 直接開啟分析儀表板)
+    if (params.get('report') === '1') {
+      loadAnalyticsData();
+      return;
+    }
+    if (params.get('admin') === '1') {
+      setShowPwdModal(true);
+    }
     const savedId = localStorage.getItem(ELDER_ID_KEY);
     if (savedId) {
       setElderId(savedId);
@@ -122,17 +152,32 @@ export default function App() {
 
   const handleOpenAnalytics = async () => {
     setShowAdminMenu(false);
-    setScreen('admin');
-    setLoadingAnalytics(true);
+    setEmailSentStatus('idle');
+    await loadAnalyticsData();
+  };
 
-    const [viewRes, rawRes] = await Promise.all([
-      supabase.from('elder_behavior_analysis').select('*').order('behavior_alert', { ascending: true }),
-      supabase.from('check_ins').select('*').order('created_at', { ascending: false }).limit(500),
-    ]);
+  const handleSendReportEmail = async () => {
+    if (sendingEmail) return;
+    setSendingEmail(true);
+    setEmailSentStatus('idle');
+    const { error } = await supabase.rpc('send_detailed_behavior_report');
+    setSendingEmail(false);
+    if (error) {
+      setEmailSentStatus('error');
+    } else {
+      setEmailSentStatus('sent');
+    }
+  };
 
-    if (viewRes.data) setAnalytics(viewRes.data);
-    if (rawRes.data) setRawRecords(rawRes.data);
-    setLoadingAnalytics(false);
+  const handleCopyShareLink = async () => {
+    const shareUrl = `${window.location.origin}/?report=1`;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 3500);
+    } catch {
+      alert(`請複製以下分析報告連結分享給同事：\n${shareUrl}`);
+    }
   };
 
   const BambooIcon = () => (
@@ -190,21 +235,49 @@ export default function App() {
 
     const autoInsights: string[] = [];
     if (highRisk.length > 0) {
-      autoInsights.push(`發現 ${highRisk.length} 位長者出現高風險訊號（${highRisk.map((h) => h.elder_id).join('、')}），建議今日優先致電或上門關懷。`);
+      autoInsights.push(`高風險預警：發現 ${highRisk.length} 位長者出現高風險訊號（${highRisk.map((h) => h.elder_id).join('、')}），建議今日優先致電或上門關懷。`);
     } else {
-      autoInsights.push('今日暫無超過 24 小時失聯或連續情緒低落之高風險個案。');
+      autoInsights.push('高風險預警：今日暫無超過 24 小時失聯或連續情緒低落之高風險個案，整體表現穩定。');
     }
     if (warnRisk.length > 0) {
-      autoInsights.push(`另有 ${warnRisk.length} 位長者今日尚未打卡或打卡時段與平日相差超過 3 小時，可於下午時段留意。`);
+      autoInsights.push(`作息與打卡提示：有 ${warnRisk.length} 位長者今日尚未打卡，或打卡時段與平日慣常時間相差超過 3 小時，建議下午時段留意。`);
     }
-    if (unhappyCnt > 0) {
-      autoInsights.push(`近 7 日共錄得 ${unhappyCnt} 次「3分 唔開心」紀錄，佔總打卡次數 ${Math.round((unhappyCnt / totalMoodCnt) * 100)}%。`);
+    if (recent7d.length > 0) {
+      autoInsights.push(`整體情緒趨勢：近 7 日共錄得 ${recent7d.length} 次打卡，開心佔 ${Math.round((happyCnt / totalMoodCnt) * 100)}%、一般佔 ${Math.round((normalCnt / totalMoodCnt) * 100)}%、唔開心佔 ${Math.round((unhappyCnt / totalMoodCnt) * 100)}%。`);
     }
+
+    // 計算選中長者的個別表現數據
+    const elderHistory = selectedElder
+      ? rawRecords.filter((r) => r.elder_id === selectedElder.elder_id)
+      : [];
+    const elderHappy = elderHistory.filter((r) => r.mood.startsWith('1')).length;
+    const elderNormal = elderHistory.filter((r) => r.mood.startsWith('2')).length;
+    const elderUnhappy = elderHistory.filter((r) => r.mood.startsWith('3')).length;
+
+    const getElderDiagnosis = (elder: BehaviorRecord) => {
+      const notes: string[] = [];
+      if (elder.behavior_alert.includes('🔴')) {
+        notes.push('⚠️ 系統偵測到此長者處於高風險狀態（超過 24 小時未打卡或近 3 日多次情緒低落），建議社工優先致電慰問。');
+      } else if (elder.behavior_alert.includes('🟡')) {
+        notes.push('🔔 今日尚未完成打卡，或打卡時間偏離平日作息，建議下午繼續觀察。');
+      } else {
+        notes.push('✅ 作息規律且情緒穩定，今日已順利完成每日打卡。');
+      }
+      if (elder.avg_checkin_hour !== null && elder.avg_checkin_hour !== undefined) {
+        const period = elder.avg_checkin_hour < 9 ? '清晨時段' : elder.avg_checkin_hour < 12 ? '上午時段' : '午間或下午';
+        notes.push(`⏰ 慣常打卡時間集中於香港時間約 ${elder.avg_checkin_hour}:00（屬${period}型作息），若當日超過此時間 3 小時仍未見紀錄便需多加留意。`);
+      }
+      if (elder.avg_mood_7d) {
+        const moodDesc = elder.avg_mood_7d <= 1.4 ? '近 7 日整體心情非常開朗愉快' : elder.avg_mood_7d <= 2.1 ? '近 7 日情緒表現平穩正常' : '近 7 日負面情緒偏多，建議關懷近況';
+        notes.push(`💛 情緒指標：7 日平均情緒分數為 ${elder.avg_mood_7d} 分（1分最開心、3分唔開心），顯示${moodDesc}。`);
+      }
+      return notes;
+    };
 
     return (
       <div className="min-h-screen bg-slate-50 text-slate-800 p-4 sm:p-6">
         <div className="max-w-4xl mx-auto space-y-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
+          <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-white p-5 rounded-2xl shadow-sm border border-slate-200">
             <div>
               <h1 className="text-xl sm:text-2xl font-bold text-slate-900 flex items-center gap-2">
                 <BarChart3 className="w-6 h-6 text-emerald-600" />
@@ -212,17 +285,55 @@ export default function App() {
               </h1>
               <p className="text-xs text-slate-500 mt-1 flex items-center gap-1">
                 <Clock className="w-3.5 h-3.5" />
-                所有時間已同步為香港標準時間（HKT / UTC+8）
+                所有時間已同步為香港標準時間（HKT / UTC+8）｜點擊任何長者編號可查看個別表現檔案
               </p>
             </div>
-            <button
-              onClick={() => setScreen('checkin')}
-              className="flex items-center justify-center gap-1.5 bg-slate-800 text-white px-4 py-2.5 rounded-xl font-medium hover:bg-slate-700"
-            >
-              <ArrowLeft className="w-4 h-4" />
-              返回打卡畫面
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={handleCopyShareLink}
+                className="flex items-center justify-center gap-1.5 bg-sky-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-sky-700 shadow-sm text-sm"
+              >
+                <Share2 className="w-4 h-4" />
+                {copiedLink ? '✅ 已複製報告連結！' : '分享分析報告連結'}
+              </button>
+              <button
+                onClick={handleSendReportEmail}
+                disabled={sendingEmail}
+                className="flex items-center justify-center gap-1.5 bg-emerald-600 text-white px-3.5 py-2.5 rounded-xl font-bold hover:bg-emerald-700 disabled:opacity-50 shadow-sm text-sm"
+              >
+                <Mail className="w-4 h-4" />
+                {sendingEmail ? '發送中...' : '發送分析報告到社工電郵'}
+              </button>
+              <button
+                onClick={() => {
+                  window.history.replaceState({}, '', '/');
+                  setScreen(elderId ? 'checkin' : 'setup');
+                }}
+                className="flex items-center justify-center gap-1.5 bg-slate-800 text-white px-3.5 py-2.5 rounded-xl font-medium hover:bg-slate-700 text-sm"
+              >
+                <ArrowLeft className="w-4 h-4" />
+                返回打卡
+              </button>
+            </div>
           </div>
+
+          {copiedLink && (
+            <div className="bg-sky-100 border border-sky-300 text-sky-900 px-4 py-3 rounded-xl font-medium flex items-center justify-between gap-2 text-sm">
+              <span>已複製專屬報告連結（<b>{window.location.origin}/?report=1</b>），可直接貼上 WhatsApp 或電郵傳送給同事查閱完整分析！</span>
+            </div>
+          )}
+
+          {emailSentStatus === 'sent' && (
+            <div className="bg-emerald-100 border border-emerald-300 text-emerald-900 px-4 py-3 rounded-xl font-medium flex items-center gap-2 text-sm">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0" />
+              完整行為分析報告（包含文字分析結論、情緒比例及長者表現明細）已發送至社工電郵！
+            </div>
+          )}
+          {emailSentStatus === 'error' && (
+            <div className="bg-red-100 border border-red-300 text-red-900 px-4 py-3 rounded-xl font-medium text-sm">
+              發送失敗，請確認 Supabase 已執行 send_detailed_behavior_report 函數。
+            </div>
+          )}
 
           {loadingAnalytics ? (
             <div className="text-center py-16 text-slate-500 text-lg">正在讀取 Supabase 數據並進行分析...</div>
@@ -252,7 +363,7 @@ export default function App() {
               <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 sm:p-5">
                 <h2 className="font-bold text-emerald-900 flex items-center gap-2 mb-2">
                   <TrendingUp className="w-5 h-5 text-emerald-700" />
-                  系統自動分析摘要
+                  系統自動行為分析結論
                 </h2>
                 <ul className="space-y-1.5 text-sm text-emerald-900 list-disc pl-5">
                   {autoInsights.map((txt, idx) => (
@@ -326,7 +437,7 @@ export default function App() {
                     </div>
                   </div>
                   <div className="text-xs text-slate-400 mt-4 pt-3 border-t border-slate-100">
-                    提示：若長者連續 3 日內出現 2 次或以上「3分 唔開心」，系統將自動標記為 🔴 優先跟進。
+                    提示：點擊下方任何長者卡片，即可開啟該長者的個別行為與歷史打卡表現檔案。
                   </div>
                 </div>
               </div>
@@ -335,13 +446,20 @@ export default function App() {
                 <div className="bg-red-50 border-2 border-red-200 rounded-2xl p-4">
                   <h2 className="text-red-800 font-bold text-lg flex items-center gap-2 mb-3">
                     <AlertCircle className="w-5 h-5" />
-                    今日優先跟進名單（{highRisk.length} 位）
+                    今日優先跟進名單（點擊查看詳細表現）
                   </h2>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                     {highRisk.map((item) => (
-                      <div key={item.elder_id} className="bg-white p-3.5 rounded-xl border border-red-200 shadow-sm">
+                      <button
+                        key={item.elder_id}
+                        onClick={() => setSelectedElder(item)}
+                        className="text-left bg-white p-3.5 rounded-xl border border-red-200 hover:border-red-400 shadow-sm transition group"
+                      >
                         <div className="flex justify-between items-center font-bold text-lg">
-                          <span>長者編號：{item.elder_id}</span>
+                          <span className="group-hover:text-red-700 flex items-center gap-1">
+                            長者編號：{item.elder_id}
+                            <ChevronRight className="w-4 h-4 text-slate-400 group-hover:translate-x-0.5 transition" />
+                          </span>
                           <span className="text-xs px-2.5 py-1 rounded-full bg-red-100 text-red-700">
                             {item.behavior_alert}
                           </span>
@@ -352,22 +470,29 @@ export default function App() {
                         <div className="text-xs text-slate-500 mt-1">
                           慣常打卡鐘數：約 {item.avg_checkin_hour ?? '-'} 時 ｜ 7日平均分：{item.avg_mood_7d ?? '-'}
                         </div>
-                      </div>
+                      </button>
                     ))}
                   </div>
                 </div>
               )}
 
               <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="px-4 py-3 bg-slate-100 font-bold text-slate-700 border-b border-slate-200">
-                  全部長者行為分析明細（共 {analytics.length} 位）
+                <div className="px-4 py-3 bg-slate-100 font-bold text-slate-700 border-b border-slate-200 flex items-center justify-between">
+                  <span>全部長者行為分析明細（共 {analytics.length} 位）</span>
+                  <span className="text-xs font-normal text-slate-500">點擊長者可查看個別 Performance</span>
                 </div>
                 <div className="divide-y divide-slate-100">
                   {analytics.map((item) => (
-                    <div key={item.elder_id} className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <button
+                      key={item.elder_id}
+                      onClick={() => setSelectedElder(item)}
+                      className="w-full text-left p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-emerald-50/50 transition group"
+                    >
                       <div>
                         <div className="flex items-center gap-2.5">
-                          <span className="font-bold text-lg text-slate-900">{item.elder_id}</span>
+                          <span className="font-bold text-lg text-slate-900 group-hover:text-emerald-700 underline decoration-slate-300 underline-offset-4">
+                            {item.elder_id}
+                          </span>
                           <span className="text-xs font-medium px-2.5 py-0.5 rounded-full bg-slate-100">
                             {item.behavior_alert}
                           </span>
@@ -376,37 +501,106 @@ export default function App() {
                           最後打卡（香港時間）：{item.last_checkin_hk || '無紀錄'}
                         </div>
                       </div>
-                      <div className="text-sm text-slate-600 sm:text-right bg-slate-50 px-3 py-2 rounded-lg">
-                        <div>近7日打卡：<b>{item.checkins_last_7d}</b> 次 ｜ 平均情緒分：<b>{item.avg_mood_7d ?? '-'}</b></div>
-                        <div className="text-xs text-slate-500 mt-0.5">慣常打卡時間：香港時間約 {item.avg_checkin_hour ?? '-'} 時</div>
+                      <div className="flex items-center gap-3">
+                        <div className="text-sm text-slate-600 sm:text-right bg-slate-50 px-3 py-2 rounded-lg">
+                          <div>近7日打卡：<b>{item.checkins_last_7d}</b> 次 ｜ 平均情緒分：<b>{item.avg_mood_7d ?? '-'}</b></div>
+                          <div className="text-xs text-slate-500 mt-0.5">慣常打卡時間：香港時間約 {item.avg_checkin_hour ?? '-'} 時</div>
+                        </div>
+                        <ChevronRight className="w-5 h-5 text-slate-400 group-hover:text-emerald-600 shrink-0" />
                       </div>
-                    </div>
+                    </button>
                   ))}
                   {analytics.length === 0 && (
                     <div className="p-8 text-center text-slate-400">暫時未有長者打卡紀錄</div>
                   )}
                 </div>
               </div>
-
-              <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="px-4 py-3 bg-slate-100 font-bold text-slate-700 border-b border-slate-200">
-                  最新打卡時間軸（香港時間 HKT）
-                </div>
-                <div className="divide-y divide-slate-100 max-h-72 overflow-y-auto">
-                  {rawRecords.slice(0, 15).map((rec) => (
-                    <div key={rec.id} className="px-4 py-2.5 flex items-center justify-between text-sm">
-                      <div className="flex items-center gap-3">
-                        <span className="font-bold text-slate-800">{rec.elder_id}</span>
-                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700">{rec.mood}</span>
-                      </div>
-                      <span className="text-slate-500 font-mono text-xs">{formatHKTime(rec.created_at)}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
             </>
           )}
         </div>
+
+        {/* 個別長者詳細 Performance 彈出檔案 */}
+        {selectedElder && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-3xl max-w-xl w-full max-h-[88vh] flex flex-col shadow-2xl overflow-hidden">
+              <div className="p-5 bg-emerald-700 text-white flex items-center justify-between">
+                <div>
+                  <div className="text-xs text-emerald-200">個別長者行為與情緒表現檔案</div>
+                  <h2 className="text-2xl font-extrabold mt-0.5">長者編號：{selectedElder.elder_id}</h2>
+                </div>
+                <button
+                  onClick={() => setSelectedElder(null)}
+                  className="p-2 rounded-full bg-white/10 hover:bg-white/20 text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-5 overflow-y-auto space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-2 bg-slate-50 p-3.5 rounded-2xl border border-slate-200">
+                  <span className="text-sm font-bold text-slate-700">目前狀態診斷：</span>
+                  <span className="text-sm font-bold px-3 py-1 rounded-full bg-white border border-slate-200 shadow-sm">
+                    {selectedElder.behavior_alert}
+                  </span>
+                </div>
+
+                {/* 個人關鍵指標 */}
+                <div className="grid grid-cols-3 gap-2.5 text-center">
+                  <div className="bg-emerald-50 p-3 rounded-2xl border border-emerald-100">
+                    <div className="text-xs text-emerald-700">😄 開心總次數</div>
+                    <div className="text-2xl font-extrabold text-emerald-700 mt-1">{elderHappy}</div>
+                  </div>
+                  <div className="bg-amber-50 p-3 rounded-2xl border border-amber-100">
+                    <div className="text-xs text-amber-700">😐 一般總次數</div>
+                    <div className="text-2xl font-extrabold text-amber-700 mt-1">{elderNormal}</div>
+                  </div>
+                  <div className="bg-rose-50 p-3 rounded-2xl border border-rose-100">
+                    <div className="text-xs text-rose-700">😡 唔開心總次數</div>
+                    <div className="text-2xl font-extrabold text-rose-700 mt-1">{elderUnhappy}</div>
+                  </div>
+                </div>
+
+                {/* 個人文字分析建議 */}
+                <div className="bg-sky-50 border border-sky-200 rounded-2xl p-4">
+                  <h3 className="font-bold text-sky-950 text-sm mb-2">🔍 個案行為與作息分析</h3>
+                  <ul className="space-y-2 text-sm text-sky-900">
+                    {getElderDiagnosis(selectedElder).map((line, i) => (
+                      <li key={i} className="leading-relaxed">{line}</li>
+                    ))}
+                  </ul>
+                </div>
+
+                {/* 個人歷史打卡時間軸 */}
+                <div>
+                  <h3 className="font-bold text-slate-800 text-sm flex items-center gap-1.5 mb-2.5">
+                    <Calendar className="w-4 h-4 text-slate-500" />
+                    歷史打卡紀錄明細（共 {elderHistory.length} 筆｜香港時間）
+                  </h3>
+                  <div className="border border-slate-200 rounded-2xl divide-y divide-slate-100 max-h-56 overflow-y-auto">
+                    {elderHistory.map((rec) => (
+                      <div key={rec.id} className="px-4 py-2.5 flex items-center justify-between text-sm">
+                        <span className="font-medium text-slate-800">{rec.mood}</span>
+                        <span className="text-xs font-mono text-slate-500">{formatHKTime(rec.created_at)}</span>
+                      </div>
+                    ))}
+                    {elderHistory.length === 0 && (
+                      <div className="p-4 text-center text-sm text-slate-400">暫無打卡紀錄</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-4 border-t border-slate-100 bg-slate-50 text-right">
+                <button
+                  onClick={() => setSelectedElder(null)}
+                  className="bg-slate-800 text-white px-5 py-2.5 rounded-xl font-bold text-sm hover:bg-slate-700"
+                >
+                  關閉檔案
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }
